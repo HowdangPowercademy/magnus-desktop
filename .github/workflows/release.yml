@@ -1,0 +1,178 @@
+name: Release Magnus Desktop
+
+# Builds the Windows installer from the app's source in the private
+# powercademy-3.0 repo (desktop/ there) and publishes it as a release here,
+# where electron-updater reads it without a token. This repo is public, so
+# these minutes are free.
+#
+# Two ways to run it:
+# - Push a tag vX.Y.Z here. X.Y.Z must equal desktop/package.json's version
+#   on the ref being built (dev by default), or the run stops before building.
+# - Run it by hand (Actions → Run workflow): pick the powercademy-3.0 ref and
+#   whether to publish. A hand run with publish off only uploads the installer
+#   as a workflow artifact, for a named tester.
+#
+# Secrets: POWERCADEMY_DEPLOY_KEY (read-only deploy key on powercademy-3.0),
+# AZURE_SIGNING_TENANT_ID / _CLIENT_ID / _CLIENT_SECRET (the CI signer app),
+# SENTRY_DSN (optional; baked into app.config.json).
+# Variables that switch signing on, once the certificate profile exists:
+# AZURE_SIGNING_PROFILE (the Trusted Signing certificate profile name) and
+# AZURE_SIGNING_PUBLISHER (the certificate's subject, e.g. "CN=Powercademy Ltd").
+# Without them the build is unsigned and marked so in the release notes.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "powercademy-3.0 ref to build (branch, tag or commit)"
+        default: "dev"
+        required: true
+      publish:
+        description: "Publish a release here (off: artifact only)"
+        type: boolean
+        default: true
+      prerelease:
+        description: "Mark the release as a pre-release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      SOURCE_REF: ${{ github.event_name == 'push' && 'dev' || inputs.ref }}
+    steps:
+      - name: Check out the app's source
+        uses: actions/checkout@v4
+        with:
+          repository: HowdangPowercademy/powercademy-3.0
+          ref: ${{ env.SOURCE_REF }}
+          ssh-key: ${{ secrets.POWERCADEMY_DEPLOY_KEY }}
+          path: src
+          sparse-checkout: |
+            desktop
+            runner
+          sparse-checkout-cone-mode: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/desktop/package-lock.json
+
+      - name: Read the versions
+        id: versions
+        working-directory: src/desktop
+        run: |
+          APP=$(node -p "require('./package.json').version")
+          RUNNER=$(node -p "require('../runner/package.json').version")
+          echo "app=$APP" >> "$GITHUB_OUTPUT"
+          echo "runner=$RUNNER" >> "$GITHUB_OUTPUT"
+          echo "Magnus Desktop $APP with runner $RUNNER from powercademy-3.0@$SOURCE_REF ($(git -C .. rev-parse --short HEAD))"
+
+      - name: The tag must name the version being built
+        if: github.event_name == 'push'
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          if [ "$TAG" != "${{ steps.versions.outputs.app }}" ]; then
+            echo "Tag v$TAG does not match desktop/package.json version ${{ steps.versions.outputs.app }} on $SOURCE_REF." >&2
+            echo "Bump the version on powercademy-3.0 first, or tag the version that is there." >&2
+            exit 1
+          fi
+
+      - name: Install
+        working-directory: src/desktop
+        run: npm ci
+
+      - name: Bake the build-time config
+        working-directory: src/desktop
+        env:
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const cfg = JSON.parse(fs.readFileSync("app.config.json", "utf8"));
+            cfg.sentryDsn = process.env.SENTRY_DSN || "";
+            fs.writeFileSync("app.config.json", JSON.stringify(cfg, null, 2) + "\n");
+            console.log("sentry:", cfg.sentryDsn ? "on" : "off");
+          '
+
+      - name: Sync the runner and draw the icons
+        working-directory: src/desktop
+        run: npm run prepare:app
+
+      - name: Smoke test the app against a throwaway Magnus
+        working-directory: src/desktop
+        run: node test/smoke.mjs "$RUNNER_TEMP/smoke"
+
+      - name: Keep the smoke screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-screenshots
+          path: ${{ runner.temp }}/smoke
+          if-no-files-found: ignore
+
+      - name: Build the installer
+        working-directory: src/desktop
+        env:
+          # electron-builder publishes to the repo this workflow runs in.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Azure Trusted Signing reads these when signing is switched on.
+          AZURE_TENANT_ID: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_SIGNING_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_SIGNING_CLIENT_SECRET }}
+          SIGNING_PROFILE: ${{ vars.AZURE_SIGNING_PROFILE }}
+          SIGNING_PUBLISHER: ${{ vars.AZURE_SIGNING_PUBLISHER }}
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+          PRERELEASE: ${{ github.event_name == 'push' || inputs.prerelease }}
+        run: |
+          ARGS=(--win nsis --publish "$([ "$PUBLISH" = "true" ] && echo always || echo never)")
+          if [ -n "$SIGNING_PROFILE" ]; then
+            echo "Signing with Azure Trusted Signing profile $SIGNING_PROFILE"
+            ARGS+=(
+              --config.win.azureSignOptions.endpoint=https://weu.codesigning.azure.net/
+              --config.win.azureSignOptions.codeSigningAccountName=powercademy-signing
+              "--config.win.azureSignOptions.certificateProfileName=$SIGNING_PROFILE"
+              "--config.win.azureSignOptions.publisherName=$SIGNING_PUBLISHER"
+            )
+          else
+            echo "No AZURE_SIGNING_PROFILE variable: this build is unsigned."
+          fi
+          if [ "$PRERELEASE" = "true" ]; then ARGS+=(--config.publish.releaseType=prerelease); fi
+          npx electron-builder "${ARGS[@]}"
+          ls -la release
+
+      - name: Keep the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Magnus-Desktop-Setup-${{ steps.versions.outputs.app }}
+          path: |
+            src/desktop/release/*.exe
+            src/desktop/release/*.blockmap
+            src/desktop/release/latest.yml
+
+      - name: Say what was published
+        if: github.event_name == 'push' || inputs.publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SIGNED: ${{ vars.AZURE_SIGNING_PROFILE != '' }}
+        run: |
+          TAG="v${{ steps.versions.outputs.app }}"
+          NOTE="Magnus Desktop ${{ steps.versions.outputs.app }}, runner ${{ steps.versions.outputs.runner }}, built from powercademy-3.0@$SOURCE_REF ($(git -C src rev-parse --short HEAD))."
+          if [ "$SIGNED" = "true" ]; then NOTE="$NOTE Signed with Azure Trusted Signing."; else NOTE="$NOTE **Unsigned beta**: Windows will warn on install; for named testers only."; fi
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes "$NOTE" || echo "release $TAG not found yet"
+          echo "$NOTE"
