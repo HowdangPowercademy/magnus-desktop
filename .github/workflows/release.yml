@@ -129,18 +129,14 @@ jobs:
       - name: Build the installer
         working-directory: src/desktop
         env:
-          # electron-builder publishes to the repo this workflow runs in.
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Azure Trusted Signing reads these when signing is switched on.
           AZURE_TENANT_ID: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_SIGNING_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_SIGNING_CLIENT_SECRET }}
           SIGNING_PROFILE: ${{ vars.AZURE_SIGNING_PROFILE }}
           SIGNING_PUBLISHER: ${{ vars.AZURE_SIGNING_PUBLISHER }}
-          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
-          PRERELEASE: ${{ github.event_name == 'push' || inputs.prerelease }}
         run: |
-          ARGS=(--win nsis --publish "$([ "$PUBLISH" = "true" ] && echo always || echo never)")
+          ARGS=(--win nsis --publish never)
           if [ -n "$SIGNING_PROFILE" ]; then
             echo "Signing with Azure Trusted Signing profile $SIGNING_PROFILE"
             ARGS+=(
@@ -152,7 +148,6 @@ jobs:
           else
             echo "No AZURE_SIGNING_PROFILE variable: this build is unsigned."
           fi
-          if [ "$PRERELEASE" = "true" ]; then ARGS+=(--config.publish.releaseType=prerelease); fi
           npx electron-builder "${ARGS[@]}"
           ls -la release
 
@@ -165,14 +160,25 @@ jobs:
             src/desktop/release/*.blockmap
             src/desktop/release/latest.yml
 
-      - name: Say what was published
+      - name: Publish the release
         if: github.event_name == 'push' || inputs.publish
+        working-directory: src/desktop
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SIGNED: ${{ vars.AZURE_SIGNING_PROFILE != '' }}
+          PRERELEASE: ${{ github.event_name == 'push' || inputs.prerelease }}
         run: |
+          # gh, not electron-builder's uploader: it creates the tag at the
+          # published commit when the tag is new, and re-uploading is a
+          # --clobber, so a rerun of the same version repairs the release.
           TAG="v${{ steps.versions.outputs.app }}"
-          NOTE="Magnus Desktop ${{ steps.versions.outputs.app }}, runner ${{ steps.versions.outputs.runner }}, built from powercademy-3.0@$SOURCE_REF ($(git -C src rev-parse --short HEAD))."
+          NOTE="Magnus Desktop ${{ steps.versions.outputs.app }}, runner ${{ steps.versions.outputs.runner }}, built from powercademy-3.0@$SOURCE_REF ($(git -C .. rev-parse --short HEAD))."
           if [ "$SIGNED" = "true" ]; then NOTE="$NOTE Signed with Azure Trusted Signing."; else NOTE="$NOTE **Unsigned beta**: Windows will warn on install; for named testers only."; fi
-          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes "$NOTE" || echo "release $TAG not found yet"
+          FILES=(release/*.exe release/*.blockmap release/latest.yml)
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${FILES[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes "$NOTE"
+          else
+            gh release create "$TAG" "${FILES[@]}" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Magnus Desktop ${{ steps.versions.outputs.app }}" --notes "$NOTE" $([ "$PRERELEASE" = "true" ] && echo --prerelease)
+          fi
           echo "$NOTE"
